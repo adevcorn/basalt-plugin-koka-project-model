@@ -66,6 +66,7 @@ struct KokaProject {
     version: Option<String>,
     main_file: Option<String>,
     test_file: Option<String>,
+    include_dirs: Vec<String>,
 }
 
 #[basalt_plugin]
@@ -149,28 +150,80 @@ fn fill_entry_files(proj: &mut KokaProject, kk_files: &[String]) {
     }
 }
 
+fn parse_string_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    inner
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn parse_manifest(contents: &str) -> KokaProject {
     let mut proj = KokaProject::default();
+    let mut in_include_block = false;
     for raw in contents.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
+        }
+        if in_include_block {
+            if let Some(item) = line.strip_prefix('-') {
+                let val = item.trim().trim_matches('"').trim_matches('\'').trim();
+                if !val.is_empty() {
+                    proj.include_dirs.push(val.to_string());
+                }
+                continue;
+            }
+            if line.ends_with(']') {
+                let before = line.trim_end_matches(']');
+                proj.include_dirs.extend(parse_string_list(before));
+                in_include_block = false;
+                continue;
+            }
+            if !line.contains('=') && !line.contains(':') {
+                proj.include_dirs.extend(parse_string_list(line));
+                continue;
+            }
+            in_include_block = false;
         }
         let sep = if line.contains('=') { '=' } else { ':' };
         let Some((key, val)) = line.split_once(sep) else {
             continue;
         };
         let key = key.trim();
-        let val = val.trim().trim_matches('"').trim_matches('\'').to_string();
+        let raw_val = val.trim();
+        let val = raw_val.trim_matches('"').trim_matches('\'').to_string();
         match key {
             "name" => proj.name = val,
             "version" => proj.version = Some(val),
             "main" | "entry" => proj.main_file = Some(val),
             "test" => proj.test_file = Some(val),
+            "include" | "includes" | "include_dirs" | "include-dirs" => {
+                if raw_val.is_empty() || (raw_val.starts_with('[') && !raw_val.ends_with(']')) {
+                    in_include_block = true;
+                    let partial = raw_val.trim_start_matches('[');
+                    proj.include_dirs.extend(parse_string_list(partial));
+                } else {
+                    proj.include_dirs.extend(parse_string_list(raw_val));
+                }
+            }
             _ => {}
         }
     }
     proj
+}
+
+fn include_args(proj: &KokaProject) -> Vec<String> {
+    proj.include_dirs
+        .iter()
+        .map(|d| format!("-i{d}"))
+        .collect()
 }
 
 fn emit_model(root: &str, manifest: &str, project: &KokaProject, prefix: &str) -> String {
@@ -253,6 +306,12 @@ fn review_actions(workspace_root: &str, _session_workspace: &str) -> Vec<ReviewA
     let Some((_, proj, _)) = discover_project(workspace_root) else {
         return Vec::new();
     };
+    let inc = include_args(&proj);
+    let inc_prefix = if inc.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", inc.join(" "))
+    };
     let mut actions = Vec::new();
     if let Some(entry) = proj.main_file {
         actions.push(ReviewActionDescriptor {
@@ -260,7 +319,7 @@ fn review_actions(workspace_root: &str, _session_workspace: &str) -> Vec<ReviewA
             title: "Type-check Koka Project".into(),
             kind: ReviewActionKind::Build,
             ecosystem: "koka".into(),
-            command_preview: format!("koka -c {entry}"),
+            command_preview: format!("koka {inc_prefix}-c {entry}"),
             mutates_workspace: false,
             priority: 100,
         });
@@ -271,7 +330,7 @@ fn review_actions(workspace_root: &str, _session_workspace: &str) -> Vec<ReviewA
             title: "Run Koka Tests".into(),
             kind: ReviewActionKind::Test,
             ecosystem: "koka".into(),
-            command_preview: format!("koka -e {test_entry}"),
+            command_preview: format!("koka {inc_prefix}-e {test_entry}"),
             mutates_workspace: false,
             priority: 100,
         });
@@ -286,12 +345,15 @@ fn review_action_plan(
     _session_workspace: &str,
 ) -> Option<ReviewActionExecutionPlan> {
     let (_, proj, _) = discover_project(workspace_root)?;
+    let mut args = include_args(&proj);
     match action_id {
         "koka-check" => {
             let entry = proj.main_file?;
+            args.push("-c".into());
+            args.push(entry);
             Some(ReviewActionExecutionPlan {
                 executable: "koka".into(),
-                args: vec!["-c".into(), entry],
+                args,
                 env: Vec::new(),
                 cwd_mode: ReviewActionCwdMode::SessionWorkspace,
                 output_category: "build".into(),
@@ -299,9 +361,11 @@ fn review_action_plan(
         }
         "koka-test" => {
             let entry = proj.test_file?;
+            args.push("-e".into());
+            args.push(entry);
             Some(ReviewActionExecutionPlan {
                 executable: "koka".into(),
-                args: vec!["-e".into(), entry],
+                args,
                 env: Vec::new(),
                 cwd_mode: ReviewActionCwdMode::SessionWorkspace,
                 output_category: "test".into(),
@@ -483,10 +547,14 @@ mod tests {
 
     #[test]
     fn parses_koka_manifest() {
-        let proj = parse_manifest("name = \"hello-koka\"\nversion = \"0.1.0\"\nmain = \"src/main.kk\"\n");
+        let proj = parse_manifest(
+            "name = \"hello-koka\"\nversion = \"0.1.0\"\nmain = \"src/main.kk\"\ninclude = [\"src\", \"test\"]\n",
+        );
         assert_eq!(proj.name, "hello-koka");
         assert_eq!(proj.version.as_deref(), Some("0.1.0"));
         assert_eq!(proj.main_file.as_deref(), Some("src/main.kk"));
+        assert_eq!(proj.include_dirs, vec!["src", "test"]);
+        assert_eq!(include_args(&proj), vec!["-isrc", "-itest"]);
     }
 
     #[test]
@@ -507,6 +575,7 @@ mod tests {
             version: Some("0.1.0".into()),
             main_file: Some("src/main.kk".into()),
             test_file: None,
+            include_dirs: vec!["src".into()],
         };
         let json = emit_model("/repo", "/repo/koka.toml", &proj, "");
         assert!(json.contains("\"ecosystem\":\"koka\""));
