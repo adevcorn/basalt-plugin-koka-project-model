@@ -1,0 +1,18 @@
+[package]
+name = "koka-project-model"
+version = "0.1.0"
+edition = "2021"
+description = "Koka project model, build system, and test runner provider for Basalt"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+basalt-plugin-sdk = { path = "../basalt-plugin-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
