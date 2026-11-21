@@ -319,7 +319,7 @@ fn review_actions(workspace_root: &str, _session_workspace: &str) -> Vec<ReviewA
             title: "Type-check Koka Project".into(),
             kind: ReviewActionKind::Build,
             ecosystem: "koka".into(),
-            command_preview: format!("koka {inc_prefix}-c {entry}"),
+            command_preview: format!("koka {inc_prefix}-l {entry}"),
             mutates_workspace: false,
             priority: 100,
         });
@@ -349,7 +349,7 @@ fn review_action_plan(
     match action_id {
         "koka-check" => {
             let entry = proj.main_file?;
-            args.push("-c".into());
+            args.push("-l".into());
             args.push(entry);
             Some(ReviewActionExecutionPlan {
                 executable: "koka".into(),
@@ -394,9 +394,26 @@ pub fn parse_koka_diagnostic(line: &str) -> Option<(String, u32, u32, bool, Stri
     ))
 }
 
+/// Detect Koka runtime test failure lines that exit with status 0
+/// (e.g. `uncaught exception: FAIL: ...` or `FAIL: ...`).
+pub fn parse_koka_test_failure(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("uncaught exception:")
+        || trimmed.starts_with("FAIL:")
+        || trimmed.starts_with("FAILED:")
+    {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 #[basalt_plugin]
 fn review_action_parse_line(
-    _action_id: &str,
+    action_id: &str,
     line: &[u8],
     state: &[u8],
 ) -> (Vec<u8>, Vec<AgentEvent>) {
@@ -418,6 +435,22 @@ fn review_action_parse_line(
             exit_code: if is_warning { 0 } else { 1 },
             output_lines: vec![msg],
         });
+    } else if action_id == "koka-test" {
+        if let Some(fail_msg) = parse_koka_test_failure(line_str) {
+            let vendor_id = format!("koka-test-fail-{}", fail_msg.len());
+            events.push(AgentEvent::NewEntry {
+                vendor_id: vendor_id.clone(),
+                tool: "koka-test".into(),
+                category: "test".into(),
+                raw_cmd: fail_msg.clone(),
+                file_paths: Vec::new(),
+            });
+            events.push(AgentEvent::CloseEntry {
+                vendor_id,
+                exit_code: 1,
+                output_lines: vec![fail_msg],
+            });
+        }
     }
     (state.to_vec(), events)
 }
@@ -580,5 +613,18 @@ mod tests {
         let json = emit_model("/repo", "/repo/koka.toml", &proj, "");
         assert!(json.contains("\"ecosystem\":\"koka\""));
         assert!(json.contains("\"language\":\"koka\""));
+    }
+
+    #[test]
+    fn detects_uncaught_koka_test_exception() {
+        assert_eq!(
+            parse_koka_test_failure("uncaught exception: FAIL: too small message rendered").as_deref(),
+            Some("uncaught exception: FAIL: too small message rendered")
+        );
+        assert_eq!(
+            parse_koka_test_failure("FAIL: assertion mismatch").as_deref(),
+            Some("FAIL: assertion mismatch")
+        );
+        assert!(parse_koka_test_failure("  ok: sessions count").is_none());
     }
 }
